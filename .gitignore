@@ -1,0 +1,17 @@
+# Model weights and caches
+hf-cache/
+models/
+
+# Python runtime
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# OS metadata
+.DS_Store
+.vscode/
+.idea/
