@@ -15,3 +15,8 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Local binaries and temp files
+koboldcpp.exe
+test.wav
+qwen3-tts.cpp/

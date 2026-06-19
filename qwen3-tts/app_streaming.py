@@ -2,9 +2,91 @@ import os
 import sys
 import asyncio
 import torch
+import types
+from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
 
 # Mock torch.cuda.synchronize as a no-op on CPU to prevent CUDA drivers crash
 torch.cuda.synchronize = lambda *args, **kwargs: None
+
+# Monkey patch torch.cat to handle DirectML 0-size tensor concatenation crash
+original_cat = torch.cat
+
+def patched_cat(tensors, dim=0, *args, **kwargs):
+    if len(tensors) > 0:
+        first_tensor = tensors[0]
+        actual_dim = dim if dim >= 0 else (first_tensor.dim() + dim)
+        filtered_tensors = [t for t in tensors if t.shape[actual_dim] > 0]
+        if len(filtered_tensors) == 0:
+            return original_cat(tensors, dim, *args, **kwargs)
+        if len(filtered_tensors) == 1:
+            return filtered_tensors[0]
+        return original_cat(filtered_tensors, dim, *args, **kwargs)
+    return original_cat(tensors, dim, *args, **kwargs)
+
+torch.cat = patched_cat
+print("[Patch] torch.cat patched successfully.")
+
+# Monkey patch RepetitionPenaltyLogitsProcessor to avoid out-of-bounds gather on DirectML
+original_repetition_penalty_call = RepetitionPenaltyLogitsProcessor.__call__
+
+def patched_repetition_penalty_call(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+    if self.prompt_ignore_length:
+        input_ids = input_ids[:, self.prompt_ignore_length :]
+
+    if scores.dim() == 3:
+        if self.logits_indices is not None and self.cu_seq_lens_q is not None:
+            last_positions = self.logits_indices
+            last_scores = scores[0, last_positions, :]
+
+            # Prepare token mask
+            token_mask = torch.zeros_like(last_scores, dtype=torch.bool)
+            cu_seq_lens = self.cu_seq_lens_q
+            lengths = cu_seq_lens[1:] - cu_seq_lens[:-1]
+            seq_indices = torch.repeat_interleave(torch.arange(len(lengths), device=input_ids.device), lengths)
+            
+            valid_mask = (input_ids >= 0) & (input_ids < last_scores.shape[1])
+            clamped_input_ids = torch.where(valid_mask, input_ids, 0)
+            token_mask[seq_indices, clamped_input_ids] = valid_mask
+
+            # Apply penalty
+            penalty_scores = torch.where(last_scores < 0, last_scores * self.penalty, last_scores / self.penalty)
+            scores[0, last_positions, :] = torch.where(token_mask, penalty_scores, last_scores)
+        else:
+            batch_size, seq_len, vocab_size = scores.shape
+            last_scores = scores[:, -1, :]
+            token_mask = torch.zeros_like(last_scores, dtype=torch.bool)
+            
+            valid_mask = (input_ids >= 0) & (input_ids < last_scores.shape[1])
+            clamped_input_ids = torch.where(valid_mask, input_ids, 0)
+            
+            if input_ids.dim() == 1:
+                valid_unique = input_ids[(input_ids >= 0) & (input_ids < last_scores.shape[1])]
+                if len(valid_unique) > 0:
+                    token_mask.scatter_(1, torch.unique(valid_unique).unsqueeze(0), True)
+            else:
+                token_mask.scatter_(1, clamped_input_ids, valid_mask)
+                
+            penalty_scores = torch.where(last_scores < 0, last_scores * self.penalty, last_scores / self.penalty)
+            scores[:, -1, :] = torch.where(token_mask, penalty_scores, last_scores)
+        return scores
+
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(1)
+
+    vocab_size = scores.shape[1]
+    valid_mask = (input_ids >= 0) & (input_ids < vocab_size)
+    clamped_input_ids = torch.where(valid_mask, input_ids, 0)
+    
+    token_mask = torch.zeros_like(scores, dtype=torch.bool)
+    token_mask.scatter_(1, clamped_input_ids, valid_mask)
+    
+    penalized_scores = torch.where(scores < 0, scores * self.penalty, scores / self.penalty)
+    scores_processed = torch.where(token_mask, penalized_scores, scores)
+    return scores_processed
+
+RepetitionPenaltyLogitsProcessor.__call__ = patched_repetition_penalty_call
+print("[Patch] RepetitionPenaltyLogitsProcessor patched successfully.")
+
 
 # --- DYNAMIC MONKEY-PATCHING FOR CPU COMPATIBILITY ---
 # faster-qwen3-tts is designed for CUDA Graphs (strictly GPU). We dynamically patch it
@@ -42,7 +124,7 @@ try:
             print(f"[Patch] Loading base Qwen3TTSModel: {model_name} on DirectML GPU {dml_device}...")
             
             # Use float16 for DirectML
-            dtype = torch.float16
+            dtype = torch.float32
             
             # Load on CPU first, then transfer to DirectML device
             base_model = Qwen3TTSModel.from_pretrained(
@@ -51,7 +133,60 @@ try:
                 torch_dtype=dtype,
                 attn_implementation="sdpa",
             )
+            
+            # Patch extract_speaker_embedding to force CPU execution for speaker_encoder
+            def patched_extract_speaker_embedding(self, audio, sr):
+                from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+                assert sr == 24000, "Only support 24kHz audio"
+                mels = mel_spectrogram(
+                    torch.from_numpy(audio).unsqueeze(0), 
+                    n_fft=1024, 
+                    num_mels=128, 
+                    sampling_rate=24000,
+                    hop_size=256, 
+                    win_size=1024, 
+                    fmin=0, 
+                    fmax=12000
+                ).transpose(1, 2)
+                
+                # Run on CPU
+                mels = mels.to("cpu").to(self.dtype)
+                self.speaker_encoder.to("cpu")
+                
+                print("[Patch] Running speaker_encoder on CPU...")
+                sys.stdout.flush()
+                speaker_embedding = self.speaker_encoder(mels)[0]
+                
+                # Return moved to target device
+                return speaker_embedding.to(self.device)
+
+            base_model.model.extract_speaker_embedding = types.MethodType(patched_extract_speaker_embedding, base_model.model)
+            print("[Patch] extract_speaker_embedding patched successfully.")
+
+            # Move base_model.model to DirectML device layer-by-layer to avoid WDDM TDR timeout
+            print("[Patch] Transferring base_model.model to DirectML device layer-by-layer...")
+            for name, child in base_model.model.named_children():
+                if name != "layers" and name != "speaker_encoder":
+                    print(f"[Patch] Moving child module: {name} ({type(child)}) to DirectML {dml_device}...")
+                    sys.stdout.flush()
+                    try:
+                        child.to(dml_device)
+                        print(f"[Patch] Child module: {name} successfully moved.")
+                    except Exception as ex:
+                        print(f"[Patch] Failed to move child {name}: {ex}")
+                        import traceback; traceback.print_exc()
+                    sys.stdout.flush()
+            if hasattr(base_model.model, "layers"):
+                for idx, layer in enumerate(base_model.model.layers):
+                    print(f"[Patch] Moving transformer layer: {idx} to DirectML...")
+                    sys.stdout.flush()
+                    base_model.model.layers[idx] = layer.to(dml_device)
+                    print(f"[Patch] Transformer layer: {idx} successfully moved.")
+                    sys.stdout.flush()
+            
+            # Move base_model.model to DirectML but keep speaker_encoder on CPU
             base_model.model = base_model.model.to(dml_device)
+            base_model.model.speaker_encoder.to("cpu")
             
             instance = cls.__new__(cls)
             instance.model = base_model
@@ -133,6 +268,8 @@ try:
         device=tts_device,
     )
 except Exception as e:
+    import traceback
+    traceback.print_exc()
     print(f"[Warning] Failed to initialize FasterQwenEngine on device {tts_device}: {e}")
     if tts_device != "cpu":
         print("Falling back to CPU...")
@@ -305,6 +442,106 @@ async def vapi_tts(request: VapiTTSRequest):
         except Exception as e:
             print(f"[Error] Failed to resample/process audio: {e}")
             # Fallback to returning raw bytes as-is
+            return Response(content=raw_bytes, media_type="audio/l16")
+
+class OpenAITTSRequest(BaseModel):
+    model: str
+    input: str
+    voice: str = "default"
+    response_format: str = "mp3"
+    speed: float = 1.0
+
+    class Config:
+        extra = "allow"
+
+@app.post("/v1/audio/speech")
+async def openai_tts(request: OpenAITTSRequest):
+    async with tts_lock:
+        chunks = []
+        def on_audio_chunk(chunk):
+            chunks.append(chunk)
+
+        # Handle voice selection
+        selected_voice = request.voice
+        if selected_voice != "default":
+            voice_pt = os.path.join(voices_dir, f"{selected_voice}.pt")
+            voice_wav = os.path.join(voices_dir, f"{selected_voice}.wav")
+            voice_txt = os.path.join(voices_dir, f"{selected_voice}.txt")
+            
+            if os.path.exists(voice_pt):
+                print(f"[OpenAI-TTS] Switching voice to precomputed: '{selected_voice}'")
+                custom_voice = FasterQwenVoice(
+                    name=selected_voice,
+                    speaker_pt=voice_pt,
+                    language="English"
+                )
+                await asyncio.to_thread(engine.set_voice, custom_voice)
+            elif os.path.exists(voice_wav) and os.path.exists(voice_txt):
+                with open(voice_txt, "r", encoding="utf-8") as f:
+                    v_text = f.read().strip()
+                
+                print(f"[OpenAI-TTS] Switching voice to: '{selected_voice}' (extracting and caching)")
+                custom_voice = FasterQwenVoice(
+                    name=selected_voice,
+                    ref_audio=voice_wav,
+                    ref_text=v_text,
+                    language="English",
+                    speaker_pt=voice_pt
+                )
+                await asyncio.to_thread(engine.set_voice, custom_voice)
+            else:
+                print(f"[Warning] Custom voice '{selected_voice}' files not found in {voices_dir}. Using default.")
+                if 'default_voice' in globals():
+                    await asyncio.to_thread(engine.set_voice, default_voice)
+
+        print(f"[OpenAI-TTS] Received text chunk: '{request.input}'")
+        stream.feed(request.input)
+        
+        # Synthesize audio blocking in worker thread
+        await asyncio.to_thread(
+            stream.play,
+            muted=True,
+            on_audio_chunk=on_audio_chunk,
+            fast_sentence_fragment=True
+        )
+        
+        raw_bytes = b"".join(chunks)
+        if not raw_bytes:
+            return Response(content=b"", media_type="audio/wav")
+            
+        try:
+            import struct
+            sample_rate = getattr(engine, "sample_rate", 24000)
+            channels = 1
+            bits_per_sample = 16
+            
+            num_samples = len(raw_bytes) // (bits_per_sample // 8)
+            data_size = num_samples * channels * (bits_per_sample // 8)
+            file_size = data_size + 36
+            
+            # WAV Header structure (44 bytes)
+            header = struct.pack('<4sI4s4sIHHIIHH4sI',
+                b'RIFF',
+                file_size,
+                b'WAVE',
+                b'fmt ',
+                16, # Subchunk1Size
+                1,  # AudioFormat (1 = PCM)
+                channels,
+                sample_rate,
+                sample_rate * channels * (bits_per_sample // 8), # ByteRate
+                channels * (bits_per_sample // 8),               # BlockAlign
+                bits_per_sample,
+                b'data',
+                data_size
+            )
+            
+            wav_bytes = header + raw_bytes
+            
+            media_type = "audio/wav" if request.response_format == "wav" else "audio/mpeg"
+            return Response(content=wav_bytes, media_type=media_type)
+        except Exception as e:
+            print(f"[Error] Failed to create WAV container: {e}")
             return Response(content=raw_bytes, media_type="audio/l16")
 
 if __name__ == "__main__":

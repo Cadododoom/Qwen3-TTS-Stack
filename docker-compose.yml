@@ -1,19 +1,19 @@
 version: '3.8'
 
 services:
-  # Dedicated streaming API for Twilio/Hermes (Locked to 0.6B)
+  # Dedicated streaming API for Twilio/Hermes
   qwen3-tts-streaming:
     build:
       context: ./qwen3-tts
       dockerfile: Dockerfile
     container_name: qwen3-tts-streaming-server
     ports:
-      - "7861:7860"
+      - "8090:7860"
     environment:
       - PORT=7860
       - MODEL_NAME=Qwen/Qwen3-TTS-12Hz-0.6B-Base
       - HF_HUB_ENABLE_HF_TRANSFER=0
-      - TTS_DEVICE=privateuseone:1
+      - TTS_DEVICE=privateuseone:2
       - LD_LIBRARY_PATH=/usr/lib/wsl/lib
       - PYTHONUNBUFFERED=1
     devices:
