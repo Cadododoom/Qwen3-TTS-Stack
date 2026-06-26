@@ -12,6 +12,7 @@ services:
       - TTS_DEVICE=cpu
       - HSA_OVERRIDE_GFX_VERSION=10.3.0
       - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=none
     devices:
       - /dev/kfd:/dev/kfd
       - /dev/dri:/dev/dri
@@ -28,14 +29,18 @@ services:
     ports:
       - "8090:8090"
     environment:
-      - QWEN3_TTS_DEVICE=vulkan0
+      - QWEN3_TTS_DEVICE=Vulkan0
       - MODEL_DIR=/models
       - MODEL_NAME=qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
       - THREADS=4
       - VOICES_DIR=/voices
+      - NVIDIA_VISIBLE_DEVICES=none
     devices:
       - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
     volumes:
       - ./models:/models
       - ./voices:/voices
+      - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
+      - /etc/vulkan:/etc/vulkan:ro
     restart: unless-stopped
