@@ -111,7 +111,34 @@ try:
         device_str = str(device).lower()
         is_dml = "privateuseone" in device_str or "dml" in device_str
         
-        if is_dml:
+        is_cuda = "cuda" in device_str
+        
+        if is_cuda:
+            # Load on GPU (ROCm)
+            dtype = torch.float16
+            print(f"[Patch] Loading base Qwen3TTSModel: {model_name} on CUDA/ROCm GPU {device_str}...")
+            sys.stdout.flush()
+            
+            base_model = Qwen3TTSModel.from_pretrained(
+                model_name,
+                device_map=device_str,
+                torch_dtype=dtype,
+                attn_implementation="sdpa",
+            )
+            
+            instance = cls.__new__(cls)
+            instance.model = base_model
+            instance.device = torch.device(device_str)
+            instance.dtype = dtype
+            instance.max_seq_len = max_seq_len
+            instance.sample_rate = cls._infer_sample_rate(base_model)
+            instance._warmed_up = True  # Skip warmup/capture steps
+            instance._voice_prompt_cache = {}
+            instance.predictor_graph = None
+            instance.talker_graph = None
+            return instance
+            
+        elif is_dml:
             import torch_directml
             # Parse index if present
             idx = 0
@@ -546,4 +573,6 @@ async def openai_tts(request: OpenAITTSRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    import os
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(app, host="0.0.0.0", port=port)

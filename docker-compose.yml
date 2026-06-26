@@ -1,55 +1,41 @@
-version: '3.8'
-
 services:
-  # Dedicated streaming API for Twilio/Hermes
-  qwen3-tts-streaming:
+  qwen3-tts-customvoice:
     build:
       context: ./qwen3-tts
       dockerfile: Dockerfile
-    container_name: qwen3-tts-streaming-server
-    ports:
-      - "8090:7860"
-    environment:
-      - PORT=7860
-      - MODEL_NAME=Qwen/Qwen3-TTS-12Hz-0.6B-Base
-      - HF_HUB_ENABLE_HF_TRANSFER=0
-      - TTS_DEVICE=privateuseone:2
-      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
-      - PYTHONUNBUFFERED=1
-    devices:
-      - /dev/dxg:/dev/dxg
-    volumes:
-      - ./hf-cache:/root/.cache/huggingface
-      - ./qwen3-tts:/app
-      - /usr/lib/wsl:/usr/lib/wsl
-    restart: unless-stopped
-
-  # Interactive Web Interface (Gradio Multi-Model Hub)
-  qwen3-tts-web:
-    build:
-      context: ./qwen3-tts
-      dockerfile: Dockerfile
-    container_name: qwen3-tts-web-server
+    container_name: qwen3-tts-customvoice-server
     ports:
       - "7860:7860"
+      - "8090:8090"
     environment:
-      - PORT=7860
-      - MODEL_NAME=Qwen/Qwen3-TTS-12Hz-0.6B-Base
+      - MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
       - HF_HUB_ENABLE_HF_TRANSFER=0
-      - TTS_DEVICE=cpu
+      - TTS_DEVICE=cuda
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
       - PYTHONUNBUFFERED=1
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
     volumes:
       - ./hf-cache:/root/.cache/huggingface
       - ./qwen3-tts:/app
-    command: ["python", "app.py", "Qwen/Qwen3-TTS-12Hz-0.6B-Base", "--ip", "0.0.0.0", "--port", "7860", "--device", "cpu", "--dtype", "float32"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
     restart: unless-stopped
 
-  llama-cpp:
-    image: ghcr.io/ggml-org/llama.cpp:full
-    container_name: llama-cpp-container
-    ports:
-      - "8080:8080"
-    entrypoint: ["sleep", "365d"]
-    volumes:
-      - ./models:/models
-    restart: unless-stopped
+  qwen3-tts-cpp:
+    build:
+      context: ../qwen3-tts.cpp
+      dockerfile: Dockerfile.vulkan
+    container_name: qwen3-tts-cpp
+    environment:
+      - QWEN3_TTS_DEVICE=vulkan0
+    devices:
+      - /dev/dri:/dev/dri
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+    restart: "no"

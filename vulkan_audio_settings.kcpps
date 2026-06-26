@@ -1,6 +1,8 @@
 {
   "usecuda": null,
-  "usevulkan": [],
+  "usevulkan": [
+    0
+  ],
   "usecpu": false,
   "model": [],
   "model_param": "",
@@ -126,12 +128,12 @@
   "sdvaedevice": -1,
   "sdvramlimit": 0,
   "whispermodel": "",
-  "ttsmodel": ".\\models\\qwen3-tts-1.7b-base-q8_0.gguf",
-  "ttswavtokenizer": ".\\models\\qwen3-tts-tokenizer-f16.gguf",
+  "ttsmodel": "./models/qwen3-tts-1.7b-base-q8_0.gguf",
+  "ttswavtokenizer": "./models/qwen3-tts-tokenizer-f16.gguf",
   "ttsgpu": true,
   "ttsmaxlen": 4096,
-  "ttsthreads": 0,
-  "ttsdir": "",
+  "ttsthreads": 8,
+  "ttsdir": "./models/preset_speakers",
   "musicllm": "",
   "musicembeddings": "",
   "musicdiffusion": "",
