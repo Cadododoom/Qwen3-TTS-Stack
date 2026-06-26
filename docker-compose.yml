@@ -6,11 +6,10 @@ services:
     container_name: qwen3-tts-customvoice-server
     ports:
       - "7860:7860"
-      - "8090:8090"
     environment:
       - MODEL_NAME=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
       - HF_HUB_ENABLE_HF_TRANSFER=0
-      - TTS_DEVICE=cuda
+      - TTS_DEVICE=cpu
       - HSA_OVERRIDE_GFX_VERSION=10.3.0
       - PYTHONUNBUFFERED=1
     devices:
@@ -19,10 +18,6 @@ services:
     volumes:
       - ./hf-cache:/root/.cache/huggingface
       - ./qwen3-tts:/app
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
     restart: unless-stopped
 
   qwen3-tts-cpp:
@@ -30,12 +25,17 @@ services:
       context: ../qwen3-tts.cpp
       dockerfile: Dockerfile.vulkan
     container_name: qwen3-tts-cpp
+    ports:
+      - "8090:8090"
     environment:
       - QWEN3_TTS_DEVICE=vulkan0
+      - MODEL_DIR=/models
+      - MODEL_NAME=qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf
+      - THREADS=4
+      - VOICES_DIR=/voices
     devices:
       - /dev/dri:/dev/dri
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-    restart: "no"
+    volumes:
+      - ./models:/models
+      - ./voices:/voices
+    restart: unless-stopped
